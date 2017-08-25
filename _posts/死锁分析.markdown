@@ -1,0 +1,171 @@
+# <center>死锁案例分析</center>
+## 1.问题描述
+最近发现有些数据库经常报警有锁等待现象，还伴随着并发连接持飙升的问题，抱着一副江湖上所有的偶然都绝非偶然，一定有一个合理的解释的心态；对这套数据库进行巡检，惊讶的发现错误日志猛增，稍稍平复下心情，发现大量的日志都是关于某个存储过程的死锁日志，这里对存储过程进行了简化，存储过程具体如下：<code>
+DELIMITER ;;
+CREATE  PROCEDURE `deadlock_test`(IN `nUid` bigint, IN `nDate` int)
+    SQL SECURITY INVOKER
+BEGIN
+START TRANSACTION;
+SELECT gold_profit  FROM test  WHERE uid = nUid AND member_score.`date` = nDate FOR UPDATE;
+select sleep(5);
+SELECT SUM(gold_profit)  FROM test WHERE uid = nUid  FOR UPDATE;
+COMMIT;
+END ;;
+DELIMITER ;</code>
+表结构如下<code>
+CREATE TABLE `member_score` (
+  `uid` int(10) unsigned NOT NULL DEFAULT '0',
+  `date` int(11) NOT NULL DEFAULT '0',
+  `gold_profit` bigint(20) unsigned NOT NULL DEFAULT '0',
+  PRIMARY KEY (`uid`,`date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8</code>
+从这个存储过程的逻辑来看，就是通过对相同的uid加锁来实现对行的排它锁，即使在并发情况下，也只会发生锁等待才对，根本不可能产生死锁，但在现实情况下，即使只开2个并发时，都会产生死锁，死锁日志具体如下：<code>
+    2017-08-24 14:02:07 7f02f47b6700InnoDB: transactions deadlock detected, dumping detailed information.
+2017-08-24 14:02:07 7f02f47b6700
+*** (1) TRANSACTION:
+TRANSACTION 1760244570, ACTIVE 2 sec starting index read
+mysql tables in use 1, locked 1
+LOCK WAIT 2 lock struct(s), heap size 360, 1 row lock(s)
+MySQL thread id 98329486, OS thread handle 0x7f02f44eb700, query id 1617343889 localhost root statistics
+SELECT gold_profit  FROM member_score  WHERE uid = nUid AND member_score.`date` = nDate FOR UPDATE
+*** (1) WAITING FOR THIS LOCK TO BE GRANTED:
+RECORD LOCKS space id 29298 page no 23000 n bits 200 index `PRIMARY` of table `test`.`member_score` trx id 1760244570 lock_mode X locks rec but not gap waiting
+Record lock, heap no 81 PHYSICAL RECORD: n_fields 5; compact format; info bits 0
+*** (2) TRANSACTION:
+TRANSACTION 1760244557, ACTIVE 5 sec starting index read, thread declared inside InnoDB 5000
+mysql tables in use 1, locked 1
+3 lock struct(s), heap size 1184, 2 row lock(s)
+MySQL thread id 98371614, OS thread handle 0x7f02f47b6700, query id 1617343930 localhost root Sending data
+SELECT SUM(gold_profit)  FROM member_score WHERE uid = nUid  FOR UPDATE
+*** (2) HOLDS THE LOCK(S):
+RECORD LOCKS space id 29298 page no 23000 n bits 200 index `PRIMARY` of table `test`.`member_score` trx id 1760244557 lock_mode X locks rec but not gap
+Record lock, heap no 81 PHYSICAL RECORD: n_fields 5; compact format; info bits 0
+*** (2) WAITING FOR THIS LOCK TO BE GRANTED:
+RECORD LOCKS space id 29298 page no 23000 n bits 200 index `PRIMARY` of table `test`.`member_score` trx id 1760244557 lock_mode X waiting
+Record lock, heap no 81 PHYSICAL RECORD: n_fields 5; compact format; info bits 0
+*** WE ROLL BACK TRANSACTION (1)</code>
+要了解这种死锁信息，首先，要对Innodb中的一些锁的基本原理有个认识；下面就简要介绍下Innodb中的锁。
+## 2.数据库中的锁结构
+数据库中的锁是用来实现一致性和隔离性的常用手段
+在通过锁实现数据库并发时，应该遵循两个并发控制准则
+1. 并发执行不能相互干扰
+2. 并发执行的性能不能低于串行执行
+也就是说用尽可能小的代价来实现并发情况下的一致性和隔离性；
+### 2.1 Innodb锁的类型
+Innodb中的锁类型可以分为表锁和行锁，这里主要讨论行锁，在行级别只存在两种标准的行级锁:
+
+* 共享锁（本文简称S锁）获取对记录的读取权限
+* 排它锁（本文简称X锁）获取对记录进行修改的权限（包括删除，因为删除实际是在该记录上的delete_flag上打标签表示是否被删除，实际也是对该记录进行修改）
+同时，InnoDB为了达到行锁的目的，实现了3种锁算法：
+ * 记录锁(record lock)：索引记录上的锁
+ * 间隙锁(本文简称gap锁)：记录间隙之间的锁，一般只会锁这条记录到上一条记录之间的范围，准确的说，gap锁是一种抑制锁，即抑制任何在间隙之间的操作
+ * next-key锁：是gap锁和行锁的结合，锁定一个范围包括记录本身；
+ 
+### 2.2 锁的实现方式
+&#160; &#160; &#160; &#160;根据锁的具体实现方式，可以分为隐式锁和显式锁，显式锁既可以是S锁也可以是X锁，隐式锁只能是X锁，隐式锁一般不存在锁结构，只有显式锁才会产生锁结构；那么什么情况下会产生隐式锁和显示锁呢，以及他们的作用是什么呢。
+&#160; &#160; &#160; &#160;首先，隐式锁实质上是记录了是否有活跃事务正在对某行记录进行插入、修改或者删除，因为Innodb的聚集索引隐藏了一个包含最新修改事务ID的列，因此，通过判断该事务id是否已经提交来判断某行记录上是否存在隐式锁（辅助索引不存在此隐藏列，只能通过辅助索引记录所对应的聚集索引来判断是否存在隐式锁），像我们正常写的insert、update、delete语句在没有其他锁竞争的情况下，实现方式都是通过隐式锁实现的；隐式锁存在以下几个特点：
+
+* 由于只需要判断记录上是否存在未提交的活跃事务id，因此隐式锁没有真正的锁结构，不会记录到全局变量lock_sys的哈希表中，因此全局不可见；
+* 隐式锁不会更新记录所在的页中记录改行的锁位图信息，代价极小；
+* 隐式锁只能是X锁，因为它代表的其实是否有事务正在对行记录进行数据修改
+* 隐式锁只能是记录锁，不会产生间隙锁
+* 如果一个事务更改或者写入了一个索引记录，那么这个事务在该记录上就会有一个隐式x锁，同样，一旦事务更改了聚集索引记录，这个事务在此记录对应的辅助索引上也存在隐式x锁，而不是显式no-gap锁。
+
+&#160; &#160; &#160; &#160;但存在一种情况，隐式锁可能会转化为显式锁，当尝试进行加锁出现等待时，就会将隐式锁转化为显式锁，因为只有显式锁才有锁结构，这样当锁释放时，才能进行唤醒等待加锁的请求。
+&#160; &#160; &#160; &#160;请记住，显式行锁会影响该记录以及该记录之前的间隙，而隐式的写锁不会影响间隙，只会锁定索引记录不被读取和更新；总的来说，隐式锁可以看做一种只在记录上加X锁，在gap上不会持有锁；而一个没有设置gap位的显式锁将会在记录和gap上都持有锁，如果gap位图上设置了，将会只锁定gap区间。
+
+### 2.3锁的管理
+&#160; &#160; &#160; &#160;MySQL中的锁是由事务和页来共同管理，一个事务里会记录该事务获取的锁和需要等待的锁，同时innodb维护了一个锁信息位图来表示页中的记录是否有锁；但有一点需要注意，如果页中某条记录或者行加了锁，将会更新lock_sys哈希表，从而告知其他活跃事务，该记录已经有锁占用；而事务中获取的锁则分为两种情况，一种是通过更新锁位图信息，来表示该记录是否加锁，另一种则是通过更新记录上的隐藏列，即当前活跃的事务id，来获取该记录上的锁，这种锁的代价很低，
+ MySQL有两种查询锁的方式：
+
+ * 根据事务查询--每个事务会通过lock_t的结构体维护一个本事务已经获取到的和正在等待的锁信息
+ * 根据记录查询--每个记录会根据记录所在的页进行哈希查询lock_sys表，然后定位锁位图信息，确定该记录上是否设置了锁。
+MySQL中的锁是通过位图方式实现的，MySQL中的页是通过lock_rec_t结构体来管理锁的，通过锁位图来标记该页中的记录是否存在锁。
+
+<code>/** Record lock for a page */
+struct lock_rec_t {
+    ulint   space;          /*!< space id */
+    ulint   page_no;        /*!< page number */
+    ulint   n_bits;         /*!< number of bits in the lock
+                    bitmap; NOTE: the lock bitmap is
+                    placed immediately after the
+                    lock struct */
+};</code>
+<div align="center"> 
+![页中加锁方式](https://raw.githubusercontent.com/club326/club326.github.io/master/deadlock/lock_rect_t.png)
+图2.3 页中的锁位图信息
+</div>
+
+&#160; &#160; &#160; &#160;每个事务含有的锁结构如下，其中type_mode不仅保留锁的类型和模式，还包括当前锁是否被授权，即是否处于等待，以及该锁是否是gap锁，如果是gap锁的话，就不会锁定本记录，只会锁定间隙：
+<code>/** Lock struct; protected by lock_sys->mutex */
+struct lock_t {
+    trx_t*      trx;        /*!< transaction owning the
+                    lock */
+    UT_LIST_NODE_T(lock_t)
+            trx_locks;  /*!< list of the locks of the
+                    transaction */
+    ulint       type_mode;  /*!< lock type, mode, LOCK_GAP or
+                    LOCK_REC_NOT_GAP,
+                    LOCK_INSERT_INTENTION,
+                    wait flag, ORed */
+    hash_node_t hash;       /*!< hash chain node for a record
+                    lock */
+    dict_index_t*   index;      /*!< index for a record lock */
+    union {
+        lock_table_t    tab_lock;/*!< table lock */
+        lock_rec_t  rec_lock;/*!< record lock */
+    } un_member;            /*!< lock details */
+};</code>
+
+### 2.4加锁规则
+&#160; &#160; &#160; &#160;MySQL锁遵循以下准则:
+
+1. 当一个事务中既有一条记录上的隐式x锁，又有一个non-gap的锁等待请求在队列中时，事务会既持有该行记录的隐式X锁并且也会存在一个显式的non-gap x锁；这样的话，当锁释放时，我们只需要通过查找显示锁等待队列就可以将锁赋予等待的锁请求；
+2. 显式锁既可以加到用户记录上，又可以加到页最大记录上，当加到最大记录上时，这个锁就是gap锁；
+3. 不同的事务不能同时拥有相同记录上相互冲突的non-gap锁，但是，他们可以拥有相互冲突的gap锁；不同的事务可以在相同的间隙拥有相互冲突的锁，因为间隙上的锁主要作用是抑制插入，或者该gap上有相互冲突的锁时，查询游标在访问该gap时必须等待；gap上的x锁表示此gap禁止写入，而不是拥有这个gap
+4. 如果等待锁请求队列中有锁请求时，不管gap锁还是非gap锁都不能在等待队列中插队；
+在纪录删除和页分裂时，数据库针对事务会产生一个新的gap类型的锁，这样的话，如果没有规则4，事务等待位图会形成一个环，导致未曾发现的死锁问题，因为死锁检测只会在事务进行锁请求时才会发起检查；
+5. 只有当显式锁请求队列中，它的前面没有其他事务相互冲突的锁模式请求时，等待的行锁请求才会拿到；
+6. 隐式锁请求不会阻塞插入，只有当其他事务也在等待一个gap锁来插入记录时，这个插入请求才会被阻塞；
+7. 当一条记录上，其他事务没有non-gap锁或者事务持有该记录的x锁时，修改该记录是被允许的；
+
+## 3.导致死锁原因分析
+&#160; &#160; &#160; &#160;再回到原来的死锁问题，从错误日志分析来看事务tx1(trx id 1760244570)在等待page 23000，heap 81上的索引记录锁，而tx2(trx id 1760244557)占用了该记录上的LOCK_REC_NOT_GAP锁，但同时tx2也在等待等待page 23000，heap 81上的记录X锁；其实，这里会引起很大的困扰，既然tx2已经占用了page 23000，heap 81上的锁，为什么还要再等待锁，其实这里锁的模式不同，tx2占有的锁是LOCK_REC_NOT_GAP锁锁，它再次请求的锁已经不同了，日志里只说了是X锁，但按照锁模式来说的话其实是next-key锁，即记录锁和gap锁的综合；
+<div align="center"> 
+![加锁顺序图](https://raw.githubusercontent.com/club326/club326.github.io/master/deadlock/死锁.jpg)
+图3.1 锁等待顺序
+</div>
+&#160; &#160; &#160; &#160;然后，Innodb的死锁检测机制就被触发；Innodb检测死锁是通过一个叫wait-for graphs来实现的，这个graph描述了不同事务之间相互等待锁的关系情况，一旦Innodb检测到wait-for graphs存在闭环，Innodb就认为出现了死锁，并强制回滚代价最小的事务；在这里，锁其实是一种资源，死锁导致事务回滚并不一定表示一定出现了死锁，而是Innodb认为当前活跃事务之间存在资源竞争，而这种竞争陷入了某种死循环，当检测到这种情况出现时，Innodb就会主动释放竞争的锁资源，回滚某些事务（注意：锁等待虽然也是一种资源竞争，但并没有陷入某种死循环，Innodb不会干预这种锁竞争，除非锁等待超时）
+<div align="center"> 
+![wait-for-graphs](https://raw.githubusercontent.com/club326/club326.github.io/master/deadlock/wait-for-graphs.jpg)
+图3.2 事务之间的锁等待关系
+</div>
+&#160; &#160; &#160; &#160;那么怎样来证明SELECT SUM(gold_profit) INTO nIOSProfitBalanceAll FROM member_score WHERE uid = nUid FOR UPDATE实际加的next-key锁呢，我们来做个演示就知道了，首先我们先向member_score表插入4条记录；<code>
+insert into member_score select 1,201705,1；
+insert into member_score select 2,201705,1;
+insert into member_score select 3,201705,1;
+insert into member_score select 6,201705,1;
+session 1
+select SUM(gold_profit)  FROM member_score WHERE uid =6 for update;
+session 2
+insert into member_score select 5,201705,1;</code>(阻塞)
+&#160; &#160; &#160; &#160;这时查看当前的锁等待信息<code>
+insert into member_score select 5,201705,1
+------- TRX HAS BEEN WAITING 10 SEC FOR THIS LOCK TO BE GRANTED:
+RECORD LOCKS space id 6088 page no 3 n bits 72 index `PRIMARY` of table `test`.`member_score` trx id 7709973943 lock_mode X locks gap before rec insert intention waiting</code>
+&#160; &#160; &#160; &#160;从上面的信息发现session1加了一个gap锁，导致插入无法成功；其实member_score表的主键是(uid,date),并不是uid，虽然查看执行计划时，session1是走的索引是主键，但其实只是主键的一部分，还是会产生next-key锁，只有针对主键或者唯一键进行等值查询时，才会加LOCK_REC_NOT_GAP锁，即只锁记录不锁gap,根据加锁规则第4条，即使是同一事务加的不同模式的锁，也必须要进行排队，最终导致死锁问题。
+
+## 4.解决方案
+&#160; &#160; &#160; &#160;其实这个案例中，主要是因为对同一记录加了不同模式的锁导致了死锁的产生，在实际的实践中，我们进行加锁尽量要根据唯一索引或者主键等值查询来加锁，这样的锁只会加到记录本身，也不会存在gap锁；
+&#160; &#160; &#160; &#160;如果在实际的使用中，必须要加gap锁，可以提前加gap锁，因为innodb针对事务内对同一记录进行二次加锁进行了优化，如果第一次加锁的锁强度强于第二次加锁的模式，则第二次不需要再进行加锁，例如我们调整存储的顺序，就能避免死锁问题，但还是会有锁等待情况；如下：<code>DELIMITER ;;
+CREATE  PROCEDURE `deal_gold_profit_test`(IN `nUid` bigint, IN `nDate` int)
+    SQL SECURITY INVOKER
+BEGIN
+START TRANSACTION;
+SELECT SUM(gold_profit)  FROM member_score WHERE uid = nUid  FOR UPDATE;
+select sleep(5);
+SELECT gold_profit  FROM member_score  WHERE uid = nUid AND member_score.`date` = nDate FOR UPDATE;
+COMMIT;
+END ;;
+DELIMITER ;</code>
+&#160; &#160; &#160; &#160;其实还有一个问题值得思考，<code>SELECT SUM(gold_profit)  FROM member_score WHERE uid = nUid  FOR UPDATE</code>是否需要再次加锁，因为主键已经加锁了，最起码主键是不可能重复了，这个可能只能看业务逻辑了。
